@@ -1175,8 +1175,8 @@ snapshot_links_per_second: 0
 # The default format is "big", the legacy SSTable format in use since Cassandra 3.0.
 # Cassandra versions 5.0 and later also support the trie-indexed "bti" format,
 # which offers better performance.
-#sstable:
-#  selected_format: big
+sstable:
+  selected_format: bti
 
 # Granularity of the collation index of rows within a partition.
 # Applies to both BIG and BTI SSTable formats. In both formats,
@@ -1192,7 +1192,7 @@ snapshot_links_per_second: 0
 # Leave undefined to use a default suitable for the SSTable format
 # in use (64 KiB for BIG, 16KiB for BTI).
 # Min unit: KiB
-# column_index_size: 4KiB
+column_index_size: 1KiB
 
 # Per sstable indexed key cache entries (the collation index in memory
 # mentioned above) exceeding this size will not be held on heap.
@@ -1204,7 +1204,7 @@ snapshot_links_per_second: 0
 #
 # This is only relevant to SSTable formats that use key cache, e.g. BIG.
 # Min unit: KiB
-column_index_cache_size: 2KiB
+column_index_cache_size: 1KiB
 
 # Default compaction strategy, applied when a table's parameters do not
 # specify compaction.
