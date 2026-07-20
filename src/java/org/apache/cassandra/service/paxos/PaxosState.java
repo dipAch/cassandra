@@ -57,6 +57,9 @@ import org.apache.cassandra.service.paxos.uncommitted.PaxosBallotTracker;
 import org.apache.cassandra.service.paxos.uncommitted.PaxosStateTracker;
 import org.apache.cassandra.service.paxos.uncommitted.PaxosUncommittedTracker;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.Nemesis;
 
 import static com.google.common.base.Preconditions.checkState;
@@ -139,6 +142,16 @@ public class PaxosState implements PaxosOperationLock
     {
         checkState(TrackerHandle.tracker != null);
         PaxosMetrics.initialize();
+        try
+        {
+            MBeanWrapper.instance.registerMBean(
+                new javax.management.StandardMBean(PaxosTraceStore.instance, PaxosTraceMBean.class),
+                PaxosTraceStore.MBEAN_NAME);
+        }
+        catch (javax.management.NotCompliantMBeanException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 
     public static void maybeRebuildUncommittedState() throws IOException
@@ -612,18 +625,24 @@ public class PaxosState implements PaxosOperationLock
                         Tracing.trace("Promising read ballot {}", ballot);
                         SystemKeyspace.savePaxosReadPromise(key.partitionKey, key.metadata, ballot);
                     }
-                    return MaybePromise.promise(before, after);
+                    MaybePromise result = MaybePromise.promise(before, after);
+                    emitPromiseEvent(ballot, key, result, before);
+                    return result;
                 }
             }
             else if (isAfter(ballot, latestWriteOrLowBound))
             {
                 Tracing.trace("Permitting only read by ballot {}", ballot);
-                return MaybePromise.permitRead(before, latest);
+                MaybePromise permitResult = MaybePromise.permitRead(before, latest);
+                emitPromiseEvent(ballot, key, permitResult, before);
+                return permitResult;
             }
             else
             {
                 Tracing.trace("Promise rejected; {} older than {}", ballot, latest);
-                return MaybePromise.reject(before, latest);
+                MaybePromise rejectResult = MaybePromise.reject(before, latest);
+                emitPromiseEvent(ballot, key, rejectResult, before);
+                return rejectResult;
             }
 
             Snapshot realAfter = new Snapshot(ballot, isWrite ? ballot : realBefore.promisedWrite, realBefore.accepted, realBefore.committed);
@@ -638,7 +657,9 @@ public class PaxosState implements PaxosOperationLock
         Tracing.trace("Promising ballot {}", ballot);
         if (isWrite) SystemKeyspace.savePaxosWritePromise(key.partitionKey, key.metadata, ballot);
         else SystemKeyspace.savePaxosReadPromise(key.partitionKey, key.metadata, ballot);
-        return MaybePromise.promise(before, after);
+        MaybePromise promiseResult = MaybePromise.promise(before, after);
+        emitPromiseEvent(ballot, key, promiseResult, before);
+        return promiseResult;
     }
 
     /**
@@ -661,6 +682,7 @@ public class PaxosState implements PaxosOperationLock
             if (!proposal.isSameOrAfter(latest))
             {
                 Tracing.trace("Rejecting proposal {}; latest is now {}", proposal.ballot, latest);
+                emitAcceptEvent(proposal, "PROPOSE_REJECT", latest.toString(), before);
                 return new AcceptResult(latest);
             }
 
@@ -683,6 +705,7 @@ public class PaxosState implements PaxosOperationLock
         // though this
         Tracing.trace("Accepting proposal {}", proposal);
         SystemKeyspace.savePaxosProposal(proposal);
+        emitAcceptEvent(proposal, "PROPOSE", null, before);
         return SUCCESS;
     }
 
@@ -733,6 +756,7 @@ public class PaxosState implements PaxosOperationLock
             // information, namely the base table mutation.  So this fact is persistent, even if knowldge of this fact
             // is not (and if this is lost, it may only lead to a future operation unnecessarily committing again)
             SystemKeyspace.savePaxosCommit(commit);
+            emitCommitEvent(commit, state != null ? state.current : null);
             postCommit.accept(commit, state);
         }
         finally
@@ -767,12 +791,14 @@ public class PaxosState implements PaxosOperationLock
                             DecoratedKey partitionKey = toPrepare.update.partitionKey();
                             TableMetadata metadata = toPrepare.update.metadata();
                             SystemKeyspace.savePaxosWritePromise(partitionKey, metadata, toPrepare.ballot);
+                            emitLegacyPrepareEvent(toPrepare, "LEGACY_PREPARE", null, before);
                             return new PrepareResponse(true, before.accepted == null ? Accepted.none(partitionKey, metadata) : before.accepted, before.committed);
                         }
                     }
                     else
                     {
                         Tracing.trace("Promise rejected; {} is not sufficiently newer than {}", toPrepare, before.promised);
+                        emitLegacyPrepareEvent(toPrepare, "LEGACY_PREPARE_REJECT", before.promised.toString(), before);
                         // return the currently promised ballot (not the last accepted one) so the coordinator can make sure it uses newer ballot next time (#5667)
                         return new PrepareResponse(false, new Commit(before.promised, toPrepare.update), before.committed);
                     }
@@ -814,12 +840,14 @@ public class PaxosState implements PaxosOperationLock
                         {
                             Tracing.trace("Accepting proposal {}", proposal);
                             SystemKeyspace.savePaxosProposal(proposal);
+                            emitAcceptEvent(proposal, "LEGACY_PROPOSE", null, before);
                             return true;
                         }
                     }
                     else
                     {
                         Tracing.trace("Rejecting proposal for {} because inProgress is now {}", proposal, before.promised);
+                        emitAcceptEvent(proposal, "LEGACY_PROPOSE_REJECT", before.promised.toString(), before);
                         return false;
                     }
                 }
@@ -829,6 +857,116 @@ public class PaxosState implements PaxosOperationLock
         {
             Keyspace.openAndGetStore(proposal.update.metadata()).metric.casPropose.addNano(nanoTime() - start);
         }
+    }
+
+    private void emitPromiseEvent(Ballot ballot, Key key, MaybePromise result, Snapshot before)
+    {
+        String phase;
+        String supersededBy = null;
+        switch (result.outcome())
+        {
+            case PROMISE:     phase = "PREPARE";        break;
+            case PERMIT_READ: phase = "PERMIT_READ";    break;
+            default:          phase = "PREPARE_REJECT";
+                              supersededBy = result.supersededBy() != null ? result.supersededBy().toString() : null;
+        }
+        String snapshotPromised  = before.promised.toString();
+        String snapshotAccepted  = before.accepted  != null ? before.accepted.ballot.toString()  : null;
+        String snapshotCommitted = before.committed.ballot.toString();
+        PaxosTraceStore.instance.add(new PaxosTraceEvent(
+            nodeId(),
+            "REPLICA",
+            phase,
+            ballot.toString(),
+            ballot.unixMicros(),
+            key.metadata.keyspace,
+            key.metadata.name,
+            ByteBufferUtil.bytesToHex(key.partitionKey.getKey()),
+            key.partitionKey.getToken().toString(),
+            System.currentTimeMillis(),
+            null,
+            result.outcome().name(),
+            supersededBy,
+            snapshotPromised, snapshotAccepted, snapshotCommitted
+        ));
+    }
+
+    private static void emitAcceptEvent(Commit proposal, String phase, String supersededBy, @Nullable Snapshot before)
+    {
+        Ballot ballot = proposal.ballot;
+        String snapshotPromised  = before != null ? before.promised.toString() : null;
+        String snapshotAccepted  = before != null && before.accepted != null ? before.accepted.ballot.toString() : null;
+        String snapshotCommitted = before != null ? before.committed.ballot.toString() : null;
+        PaxosTraceStore.instance.add(new PaxosTraceEvent(
+            nodeId(),
+            "REPLICA",
+            phase,
+            ballot.toString(),
+            ballot.unixMicros(),
+            proposal.update.metadata().keyspace,
+            proposal.update.metadata().name,
+            ByteBufferUtil.bytesToHex(proposal.update.partitionKey().getKey()),
+            proposal.update.partitionKey().getToken().toString(),
+            System.currentTimeMillis(),
+            null,
+            supersededBy == null ? "ACCEPTED" : "REJECTED",
+            supersededBy,
+            snapshotPromised, snapshotAccepted, snapshotCommitted
+        ));
+    }
+
+    private static void emitCommitEvent(Commit commit, @Nullable Snapshot before)
+    {
+        Ballot ballot = commit.ballot;
+        String snapshotPromised  = before != null ? before.promised.toString() : null;
+        String snapshotAccepted  = before != null && before.accepted != null ? before.accepted.ballot.toString() : null;
+        String snapshotCommitted = before != null ? before.committed.ballot.toString() : null;
+        PaxosTraceStore.instance.add(new PaxosTraceEvent(
+            nodeId(),
+            "REPLICA",
+            "COMMIT",
+            ballot.toString(),
+            ballot.unixMicros(),
+            commit.update.metadata().keyspace,
+            commit.update.metadata().name,
+            ByteBufferUtil.bytesToHex(commit.update.partitionKey().getKey()),
+            commit.update.partitionKey().getToken().toString(),
+            System.currentTimeMillis(),
+            null,
+            null,
+            null,
+            snapshotPromised, snapshotAccepted, snapshotCommitted
+        ));
+    }
+
+    private static void emitLegacyPrepareEvent(Commit toPrepare, String phase, String supersededBy, @Nullable Snapshot before)
+    {
+        Ballot ballot = toPrepare.ballot;
+        String snapshotPromised  = before != null ? before.promised.toString() : null;
+        String snapshotAccepted  = before != null && before.accepted != null ? before.accepted.ballot.toString() : null;
+        String snapshotCommitted = before != null ? before.committed.ballot.toString() : null;
+        PaxosTraceStore.instance.add(new PaxosTraceEvent(
+            nodeId(),
+            "REPLICA",
+            phase,
+            ballot.toString(),
+            ballot.unixMicros(),
+            toPrepare.update.metadata().keyspace,
+            toPrepare.update.metadata().name,
+            ByteBufferUtil.bytesToHex(toPrepare.update.partitionKey().getKey()),
+            toPrepare.update.partitionKey().getToken().toString(),
+            System.currentTimeMillis(),
+            null,
+            supersededBy == null ? "PROMISED" : "REJECTED",
+            supersededBy,
+            snapshotPromised, snapshotAccepted, snapshotCommitted
+        ));
+    }
+
+    private static String nodeId()
+    {
+        try { return FBUtilities.getBroadcastAddressAndPort().toString(); }
+        catch (Exception e) { return "unknown"; }
     }
 
     public static void unsafeReset()

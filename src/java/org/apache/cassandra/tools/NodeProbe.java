@@ -192,6 +192,7 @@ public class NodeProbe implements AutoCloseable
     protected AutoRepairServiceMBean autoRepairProxy;
     protected AsyncProfilerMBean asyncProfilerProxy;
     protected GuardrailsMBean grProxy;
+    protected org.apache.cassandra.service.paxos.PaxosTraceMBean paxosTraceProxy;
     protected volatile Output output;
 
     protected CIDRFilteringMetricsTableMBean cfmProxy;
@@ -344,6 +345,9 @@ public class NodeProbe implements AutoCloseable
 
             name = new ObjectName(Guardrails.MBEAN_NAME);
             grProxy = JMX.newMBeanProxy(mbeanServerConn, name, GuardrailsMBean.class);
+
+            name = new ObjectName(org.apache.cassandra.service.paxos.PaxosTraceStore.MBEAN_NAME);
+            paxosTraceProxy = JMX.newMBeanProxy(mbeanServerConn, name, org.apache.cassandra.service.paxos.PaxosTraceMBean.class);
         }
         catch (MalformedObjectNameException e)
         {
@@ -1814,6 +1818,21 @@ public class NodeProbe implements AutoCloseable
     public void setTraceProbability(double value)
     {
         ssProxy.setTraceProbability(value);
+    }
+
+    public java.util.List<String> getPaxosTraceEvents(String keyspaceTable)
+    {
+        return paxosTraceProxy.getEvents(keyspaceTable);
+    }
+
+    public String getHost()
+    {
+        return host;
+    }
+
+    public int getJmxPort()
+    {
+        return port;
     }
 
     public String getSchemaVersion()

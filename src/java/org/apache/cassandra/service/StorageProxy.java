@@ -181,6 +181,7 @@ import org.apache.cassandra.tcm.ownership.VersionedEndpoints;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.triggers.TriggerExecutor;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MBeanWrapper;
@@ -589,6 +590,7 @@ public class StorageProxy implements StorageProxyMBean
     throws UnavailableException, IsBootstrappingException, RequestFailureException, RequestTimeoutException, InvalidRequestException
     {
         int contentions = 0;
+        String paxosRoundId = java.util.UUID.randomUUID().toString();
         Keyspace keyspace = Keyspace.open(metadata.keyspace);
         AbstractReplicationStrategy latestRs = keyspace.getReplicationStrategy();
         try
@@ -614,6 +616,7 @@ public class StorageProxy implements StorageProxyMBean
 
                 final Ballot ballot = pair.ballot;
                 contentions += pair.contentions;
+                emitCoordinatorEvent("PREPARE_DONE", ballot, metadata, key, paxosRoundId, "PROMISED", null);
 
                 Pair<PartitionUpdate, RowIterator> proposalPair = createUpdateProposal.apply(ballot);
                 // See method javadoc: null here is code for "stop here and return null".
@@ -624,12 +627,16 @@ public class StorageProxy implements StorageProxyMBean
                 Tracing.trace("CAS precondition is met; proposing client-requested updates for {}", ballot);
                 if (proposePaxos(proposal, replicaPlan, true, requestTime))
                 {
+                    emitCoordinatorEvent("PROPOSE_DONE", ballot, metadata, key, paxosRoundId, "ACCEPTED", null);
                     // We skip committing accepted updates when they are empty. This is an optimization which works
                     // because we also skip replaying those same empty update in beginAndRepairPaxos (see the longer
                     // comment there). As empty update are somewhat common (serial reads and non-applying CAS propose
                     // them), this is worth bothering.
                     if (!proposal.update.isEmpty())
+                    {
                         commitPaxos(proposal, consistencyForCommit, true, requestTime);
+                        emitCoordinatorEvent("COMMIT_DONE", ballot, metadata, key, paxosRoundId, null, null);
+                    }
                     RowIterator result = proposalPair.right;
                     if (result != null)
                         Tracing.trace("CAS did not apply");
@@ -638,6 +645,7 @@ public class StorageProxy implements StorageProxyMBean
                     return result;
                 }
 
+                emitCoordinatorEvent("PROPOSE_DONE", ballot, metadata, key, paxosRoundId, "REJECTED", null);
                 Tracing.trace("Paxos proposal not accepted (pre-empted by a higher ballot)");
                 contentions++;
 
@@ -664,6 +672,34 @@ public class StorageProxy implements StorageProxyMBean
         }
 
         throw new CasWriteTimeoutException(WriteType.CAS, consistencyForPaxos, 0, consistencyForPaxos.blockFor(latestRs), contentions);
+    }
+
+    private static void emitCoordinatorEvent(String phase,
+                                             Ballot ballot,
+                                             TableMetadata metadata,
+                                             DecoratedKey key,
+                                             String roundId,
+                                             String outcome,
+                                             String supersededBy)
+    {
+        org.apache.cassandra.service.paxos.PaxosTraceStore.instance.add(
+            new org.apache.cassandra.service.paxos.PaxosTraceEvent(
+                FBUtilities.getBroadcastAddressAndPort().toString(),
+                "COORDINATOR",
+                phase,
+                ballot.toString(),
+                ballot.unixMicros(),
+                metadata.keyspace,
+                metadata.name,
+                ByteBufferUtil.bytesToHex(key.getKey()),
+                key.getToken().toString(),
+                System.currentTimeMillis(),
+                roundId,
+                outcome,
+                supersededBy,
+                null, null, null   // snapshot fields — coordinator has no replica state
+            )
+        );
     }
 
     /**
